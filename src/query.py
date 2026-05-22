@@ -28,6 +28,8 @@ class QuerySpec:
     severity_requested: bool = False
     food_insecurity_requested: bool = False
     displacement_requested: bool = False
+    structural_neglect_requested: bool = False
+    chronic_underfunding_requested: bool = False
     unparsed_terms: list[str] = field(default_factory=list)
 
 
@@ -119,6 +121,18 @@ def _parse_displacement_requested(text: str) -> bool:
     return bool(re.search(r"\b(displacement|displaced|idp|idps|refugee|refugees)\b", text, flags=re.I))
 
 
+def _parse_structural_neglect_requested(text: str) -> bool:
+    patterns = [
+        r"\bstructural\s+(?:neglect|underfunding)\b",
+        r"\bchronic(?:ally)?\s+underfund(?:ed|ing)?\b",
+        r"\bconsistently\s+underfund(?:ed|ing)?\b",
+        r"\bunderfund(?:ed|ing)?\s+across\s+multiple\s+years\b",
+        r"\bmultiple\s+years\b",
+        r"\bacross\s+years\b",
+    ]
+    return any(re.search(pattern, text, flags=re.I) for pattern in patterns)
+
+
 def _unparsed_terms(text: str, spec: QuerySpec) -> list[str]:
     lower = text.lower()
     recognized_phrases = set(REGION_SCOPES) | set(SECTOR_ALIASES) | {
@@ -176,6 +190,18 @@ def _unparsed_terms(text: str, spec: QuerySpec) -> list[str]:
         "cbpf",
         "high",
         "low",
+        "structural",
+        "neglect",
+        "chronic",
+        "chronically",
+        "consistently",
+        "underfunded",
+        "underfunding",
+        "multiple",
+        "years",
+        "regions",
+        "region",
+        "hotspots",
     }
     for alias in COUNTRY_ALIASES:
         recognized_phrases.update(alias.lower().split())
@@ -197,6 +223,7 @@ def _unparsed_terms(text: str, spec: QuerySpec) -> list[str]:
 
 def parse_query(raw_query: str | None) -> QuerySpec:
     text = raw_query or ""
+    structural_neglect_requested = _parse_structural_neglect_requested(text)
     spec = QuerySpec(
         raw_query=text,
         year=_parse_year(text),
@@ -209,6 +236,8 @@ def parse_query(raw_query: str | None) -> QuerySpec:
         severity_requested=_parse_severity_requested(text),
         food_insecurity_requested=_parse_food_insecurity_requested(text),
         displacement_requested=_parse_displacement_requested(text),
+        structural_neglect_requested=structural_neglect_requested,
+        chronic_underfunding_requested=structural_neglect_requested,
     )
     if spec.food_insecurity_requested and spec.sector is None:
         spec.sector = "food"

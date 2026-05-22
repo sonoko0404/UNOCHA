@@ -42,6 +42,6 @@ Checked on 2026-05-21.
 - CBPF data is large enough that it should be cached locally. The current script downloads it once and reuses the cached CSV.
 - ReliefWeb links in the challenge are reference/example documents rather than required structured datasets. They are not part of the v1 scoring pipeline.
 - Shared multi-country FTS flow-detail rows are excluded from concentration metrics because allocating the same regional amount to every destination would inflate country totals.
-- HRP active status is inferred from `startDate`, `endDate`, and selected plan year in the HRP metadata. It is surfaced as `has_active_hrp`, `active_hrp_names`, and `hrp_status`.
-- Need-intensity severity context is computed only where COD population baselines match a row. It uses `HNO people_in_need / COD admin0 population` and is labeled as local context, not as an INFORM severity index.
-- CBPF country mapping uses the pooled-fund-name alias table. Rows with mapped CBPF allocation receive `cbpf_mapping_confidence=medium_alias_table`; detected unmapped CBPF funds are written to `data/processed/unmapped_cbpf_funds.csv`.
+- HRP active status uses a status field when present. The local `humanitarian-response-plans.csv` file has no explicit status field, so current matches are inferred from `startDate`, `endDate`, and selected plan year and labelled `medium_date_inferred`.
+- Need-intensity severity context is computed only where COD population baselines match a row. It uses `HNO people_in_need / COD admin0 population` and is labeled as proxy context, not as INFORM, IPC, or IDP severity.
+- CBPF country mapping uses the pooled-fund-name alias table. Rows with mapped CBPF allocation receive `cbpf_mapping_confidence=alias_match`; detected unmapped CBPF funds are written to `data/processed/unmapped_cbpf_funds.csv`.

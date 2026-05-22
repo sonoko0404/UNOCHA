@@ -421,15 +421,31 @@ def prepare_display_data(df: pd.DataFrame) -> pd.DataFrame:
         "top_recipient",
         "top_recipient_share",
         "supplemental_data_flags",
+        "iso3",
+        "funding_gap",
+        "cbpf_budget_usd",
+        "cbpf_allocation_usd",
+        "cbpf_allocation",
         "has_active_hrp",
         "active_hrp_names",
         "hrp_status",
+        "hrp_plan_name",
+        "hrp_plan_type",
+        "hrp_year",
+        "hrp_match_confidence",
+        "hrp_data_quality",
+        "severity_available",
         "severity_scale",
         "severity_rank",
         "severity_context",
         "severity_source",
+        "inform_severity_score",
+        "inform_severity_level",
+        "chronic_underfunding_count",
+        "chronic_underfunding_scale",
         "cbpf_mapping_confidence",
         "cbpf_country_source",
+        "cbpf_gap_scale",
     ]
     for col in optional_cols:
         if col not in work.columns:
@@ -441,6 +457,8 @@ def prepare_display_data(df: pd.DataFrame) -> pd.DataFrame:
     work["cbpf_m"] = work["cbpf_budget_usd"] / 1_000_000
     work["funding_pct_label"] = work["funding_pct"].map(fmt_pct)
     work["people_label"] = work["people_in_need"].map(fmt_num)
+    if "cbpf_budget_usd" not in work.columns:
+        work["cbpf_budget_usd"] = work["cbpf_allocation_usd"]
     work["cbpf_label"] = work["cbpf_budget_usd"].map(fmt_money)
     work["score_label"] = work["overlooked_score"].map(lambda value: f"{value:.1f}")
     work["pin_population_share_label"] = work["pin_population_share"].map(fmt_pct)
@@ -504,6 +522,7 @@ def render_query_audit(query: str, selected_year: int, min_people: int) -> None:
     spec = parse_query(query)
     hrp_filter = getattr(spec, "hrp_filter", None)
     severity_requested = bool(getattr(spec, "severity_requested", False))
+    structural_neglect_requested = bool(getattr(spec, "structural_neglect_requested", False))
     unparsed_terms = getattr(spec, "unparsed_terms", [])
     cards = [
         method_card("Parsed year", str(selected_year), f"Query text year: {spec.year}; sidebar year takes precedence."),
@@ -525,6 +544,11 @@ def render_query_audit(query: str, selected_year: int, min_people: int) -> None:
             "Severity terms",
             "requested" if severity_requested else "not requested",
             "Local severity context uses HNO PIN / COD population; no INFORM/IPC/IDP file is cached.",
+        ),
+        method_card(
+            "Structural neglect",
+            "requested" if structural_neglect_requested else "not requested",
+            "Intent is parsed for analyst context; chronic underfunding is already part of the score.",
         ),
         method_card(
             "Unparsed terms",
@@ -706,17 +730,23 @@ def render_ranking_table(df: pd.DataFrame) -> None:
     display_cols = [
         "rank",
         "country",
+        "iso3",
         "region",
         "people_in_need",
         "has_active_hrp",
+        "hrp_status",
         "funding_pct",
+        "funding_gap",
         "pin_population_share",
+        "severity_available",
         "severity_scale",
         "worst_sector",
         "worst_sector_funding_pct",
-        "cbpf_budget_usd",
+        "cbpf_allocation_usd",
         "cbpf_mapping_confidence",
         "cbpf_per_person_in_need",
+        "cbpf_gap_scale",
+        "chronic_underfunding_count",
         "top_recipient",
         "top_recipient_share",
         "overlooked_score",
@@ -725,16 +755,22 @@ def render_ranking_table(df: pd.DataFrame) -> None:
         "data_quality_flags",
         "supplemental_data_flags",
     ]
+    for col in display_cols:
+        if col not in df.columns:
+            df[col] = pd.NA
     st.dataframe(
         df[display_cols].style.format(
             {
                 "people_in_need": "{:,.0f}",
                 "funding_pct": "{:.1%}",
+                "funding_gap": "{:.1%}",
                 "pin_population_share": "{:.1%}",
                 "severity_scale": "{:.1%}",
                 "worst_sector_funding_pct": "{:.1%}",
-                "cbpf_budget_usd": "${:,.0f}",
+                "cbpf_allocation_usd": "${:,.0f}",
                 "cbpf_per_person_in_need": "${:,.2f}",
+                "cbpf_gap_scale": "{:.1%}",
+                "chronic_underfunding_count": "{:,.0f}",
                 "top_recipient_share": "{:.1%}",
                 "overlooked_score": "{:.1f}",
             }
@@ -1194,11 +1230,15 @@ def explode_flags(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def render_evidence_trace(results: pd.DataFrame, evidence_cols: list[str]) -> None:
+    for col in evidence_cols:
+        if col not in results.columns:
+            results[col] = pd.NA
     view = results.head(10)[evidence_cols].copy()
     money_cols = [
         "requirements_usd",
         "funding_usd",
         "cbpf_budget_usd",
+        "cbpf_allocation_usd",
         "incoming_total_usd",
         "top_donor_usd",
         "outgoing_total_usd",
@@ -1212,6 +1252,7 @@ def render_evidence_trace(results: pd.DataFrame, evidence_cols: list[str]) -> No
         "outgoing_flow_records",
         "active_hrp_count",
         "severity_rank",
+        "chronic_underfunding_count",
     ]
     percent_cols = [
         "funding_pct",
@@ -1220,6 +1261,9 @@ def render_evidence_trace(results: pd.DataFrame, evidence_cols: list[str]) -> No
         "top_donor_share",
         "top_recipient_share",
         "severity_scale",
+        "funding_gap",
+        "cbpf_gap_scale",
+        "chronic_underfunding_scale",
     ]
 
     for col in money_cols:
@@ -1255,7 +1299,7 @@ def render_method_panel(results: pd.DataFrame, raw_results: pd.DataFrame, year: 
     active_hrp_matched = int(results["has_active_hrp"].fillna(False).sum()) if "has_active_hrp" in results else 0
     severity_matched = int(results["severity_scale"].notna().sum()) if "severity_scale" in results else 0
     cbpf_alias_mapped = (
-        int(results["cbpf_mapping_confidence"].eq("medium_alias_table").sum())
+        int(results["cbpf_mapping_confidence"].eq("alias_match").sum())
         if "cbpf_mapping_confidence" in results
         else 0
     )
@@ -1264,9 +1308,9 @@ def render_method_panel(results: pd.DataFrame, raw_results: pd.DataFrame, year: 
         method_card("Need source", f"HNO {hno_years}", hno_files or "No HNO source file available in result rows."),
         method_card("Need threshold", fmt_num(min_people), "Rows below the minimum people-in-need threshold are excluded before scoring display."),
         method_card("Funding coverage range", coverage_range, "Computed from FTS funding divided by stated requirements for the selected year."),
-        method_card("Active HRP match", f"{active_hrp_matched}/{len(results)} rows", "Active status is inferred from HRP metadata dates and selected plan year."),
+        method_card("Active HRP match", f"{active_hrp_matched}/{len(results)} rows", "Uses HRP status when present; this local HRP file is date-inferred because no status field is available."),
         method_card("Mapped CBPF total", fmt_money(cbpf_total), f"{int((results['cbpf_budget_usd'].fillna(0) > 0).sum())} rows have mapped CBPF allocations."),
-        method_card("CBPF mapping confidence", f"{cbpf_alias_mapped}/{len(results)} alias-mapped", "CBPF country mapping uses pooled fund name aliases and is flagged as prototype-level."),
+        method_card("CBPF mapping confidence", f"{cbpf_alias_mapped}/{len(results)} alias-mapped", "CBPF country mapping uses pooled fund name aliases and is flagged in the output."),
         method_card("Quality flags", str(int((results["data_quality_flags"] != "ok").sum())), "Rows with non-ok flags remain visible so uncertainty is not hidden."),
         method_card("COD population match", f"{population_matched}/{len(results)} rows", "Admin0 total rows from cod_population_admin0.csv; used only for PIN-share context."),
         method_card("Severity context match", f"{severity_matched}/{len(results)} rows", "Local context uses HNO PIN divided by COD population; no INFORM/IPC/IDP file is cached."),
@@ -1281,8 +1325,8 @@ def render_method_panel(results: pd.DataFrame, raw_results: pd.DataFrame, year: 
         "Need and financing are separate signals; funding coverage does not redefine need.",
         "Sector-level PIN values are not summed across sectors because populations can overlap.",
         "CBPF is shown as a pooled-fund allocation lens, not as total humanitarian funding.",
-        "HRP active status is derived from HRP metadata dates and selected plan year.",
-        "Need-intensity severity context uses HNO PIN / COD population; it is not an INFORM replacement.",
+        "HRP active status uses HRP status when present; this local file falls back to date and year inference.",
+        "Need-intensity severity context uses HNO PIN / COD population; it is not INFORM or IPC severity.",
         "CBPF country mapping confidence is surfaced because pooled fund name aliasing is prototype-level.",
         "COD population baselines contextualize scale; they do not replace HNO people-in-need values.",
         "Shared multi-country FTS flows are excluded from flow concentration to avoid double counting.",
@@ -1340,6 +1384,7 @@ def render_method_panel(results: pd.DataFrame, raw_results: pd.DataFrame, year: 
     evidence_cols = [
         "rank",
         "country",
+        "iso3",
         "hno_year",
         "sector_label",
         "need_selection",
@@ -1347,16 +1392,25 @@ def render_method_panel(results: pd.DataFrame, raw_results: pd.DataFrame, year: 
         "requirements_usd",
         "funding_usd",
         "funding_pct",
+        "funding_gap",
         "has_active_hrp",
+        "hrp_plan_name",
+        "hrp_plan_type",
         "active_hrp_names",
         "hrp_status",
+        "hrp_match_confidence",
+        "hrp_data_quality",
+        "cbpf_allocation_usd",
         "cbpf_budget_usd",
         "cbpf_projects",
         "cbpf_mapping_confidence",
+        "cbpf_gap_scale",
         "population_baseline",
         "pin_population_share",
+        "severity_available",
         "severity_scale",
         "severity_context",
+        "severity_source",
         "worst_sector",
         "worst_sector_funding_pct",
         "incoming_total_usd",
@@ -1366,6 +1420,7 @@ def render_method_panel(results: pd.DataFrame, raw_results: pd.DataFrame, year: 
         "top_recipient",
         "top_recipient_share",
         "underfunded_years_last_3",
+        "chronic_underfunding_scale",
         "confidence",
         "data_quality_flags",
         "supplemental_data_flags",

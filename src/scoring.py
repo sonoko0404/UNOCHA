@@ -128,6 +128,10 @@ def _supplemental_flags(row: pd.Series) -> str:
         flags.append("no_single_country_incoming_flow_detail")
     if not bool(row.get("has_active_hrp", False)):
         flags.append("no_matched_active_hrp")
+    if "no_status" in str(row.get("hrp_data_quality", "")):
+        flags.append("hrp_status_inferred_without_status_field")
+    if not bool(row.get("severity_available", False)):
+        flags.append("no_formal_severity_dataset")
     return "; ".join(flags) if flags else "ok"
 
 
@@ -148,7 +152,7 @@ def _build_explanation(row: pd.Series) -> str:
     else:
         coverage_text = f"{coverage:.0%} funded"
 
-    cbpf = row.get("cbpf_budget_usd", 0)
+    cbpf = row.get("cbpf_allocation_usd", row.get("cbpf_budget_usd", 0))
     chronic = row.get("underfunded_years_last_3", 0)
     explanation = (
         f"{row.get('country')} ranks {row.get('overlooked_level')} because it has "
@@ -163,17 +167,23 @@ def _build_explanation(row: pd.Series) -> str:
             f"COD admin0 data puts PIN at {row.get('pin_population_share'):.1%} of the population baseline."
         )
     if bool(row.get("has_active_hrp", False)):
+        plan_name = row.get("hrp_plan_name")
+        plan_text = f" ({plan_name})" if isinstance(plan_name, str) and plan_name.strip() else ""
         supplemental.append(
-            f"It has an active HRP in {int(row.get('year'))}; matched FTS funding coverage is {coverage_text}."
+            f"It has an active HRP in {int(row.get('year'))}{plan_text}; matched FTS funding coverage is {coverage_text}."
         )
     else:
         supplemental.append(
             f"Need is documented for {int(row.get('year'))}, but no matched active HRP was found in the HRP metadata."
         )
-    if not pd.isna(row.get("severity_scale")):
+    if bool(row.get("severity_available", False)):
         supplemental.append(
-            f"The available need-intensity context ranks at percentile {row.get('severity_scale'):.0%} "
-            "based on HNO PIN divided by COD admin0 population."
+            f"Formal severity data is available from {row.get('severity_source')}."
+        )
+    elif not pd.isna(row.get("severity_scale")):
+        supplemental.append(
+            f"The need-context proxy ranks at percentile {row.get('severity_scale'):.0%} "
+            "based on HNO PIN divided by COD admin0 population; it is not INFORM or IPC severity."
         )
     if not pd.isna(row.get("worst_sector")):
         supplemental.append(
@@ -200,6 +210,11 @@ def _summarize_hrp(hrp: pd.DataFrame, year: int) -> pd.DataFrame:
         "active_hrp_codes",
         "active_hrp_types",
         "hrp_status",
+        "hrp_plan_name",
+        "hrp_plan_type",
+        "hrp_year",
+        "hrp_match_confidence",
+        "hrp_data_quality",
     ]
     if hrp.empty:
         return pd.DataFrame(columns=columns)
@@ -207,47 +222,63 @@ def _summarize_hrp(hrp: pd.DataFrame, year: int) -> pd.DataFrame:
     work = hrp[hrp["year"] == year].copy()
     if work.empty:
         return pd.DataFrame(columns=columns)
-    for col in ("plan_name", "plan_code", "plan_type"):
+    for col in ("plan_name", "plan_code", "plan_type", "hrp_status_normalized", "hrp_data_quality"):
         if col not in work.columns:
             work[col] = ""
     if "hrp_is_active" not in work.columns:
-        work["hrp_is_active"] = True
+        work["hrp_is_active"] = False
 
-    any_plan = (
-        work.groupby("country_iso3", as_index=False)
-        .agg(has_hrp_record=("plan_code", "size"))
-        .assign(has_hrp_record=True)
-    )
-    active = work[work["hrp_is_active"].fillna(False).astype(bool)].copy()
-    if active.empty:
-        any_plan["has_active_hrp"] = False
-        any_plan["active_hrp_count"] = 0
-        any_plan["active_hrp_names"] = ""
-        any_plan["active_hrp_codes"] = ""
-        any_plan["active_hrp_types"] = ""
-        any_plan["hrp_status"] = "hrp_record_not_active"
-        return any_plan[columns]
+    def joined(values: pd.Series) -> str:
+        clean = [str(value).strip() for value in values if str(value).strip() and str(value) != "nan"]
+        return "; ".join(sorted(set(clean))[:4])
 
-    summary = (
-        active.groupby("country_iso3", as_index=False)
-        .agg(
-            active_hrp_count=("plan_code", "nunique"),
-            active_hrp_names=("plan_name", lambda values: "; ".join(sorted(set(map(str, values)))[:4])),
-            active_hrp_codes=("plan_code", lambda values: "; ".join(sorted(set(map(str, values)))[:4])),
-            active_hrp_types=("plan_type", lambda values: "; ".join(sorted(set(map(str, values)))[:4])),
+    records: list[dict[str, object]] = []
+    for iso3, group in work.groupby("country_iso3"):
+        active = group[group["hrp_is_active"].fillna(False).astype(bool)].copy()
+        chosen = active if not active.empty else group
+        chosen = chosen.assign(
+            _plan_priority=chosen["plan_type"]
+            .fillna("")
+            .astype(str)
+            .str.lower()
+            .str.contains("humanitarian needs and response plan|humanitarian response plan", regex=True)
+            .map({True: 0, False: 1})
+        ).sort_values(["_plan_priority", "plan_code"])
+        chosen_first = chosen.iloc[0]
+        status_values = chosen["hrp_status_normalized"].fillna("").astype(str)
+        quality_values = chosen["hrp_data_quality"].fillna("").astype(str)
+        active_count = int(active["plan_code"].nunique()) if not active.empty else 0
+
+        if active_count > 0:
+            if status_values.str.contains("status_active", regex=False).any():
+                confidence = "high_status_field"
+            elif status_values.str.contains("date_overlap", regex=False).any():
+                confidence = "medium_date_inferred"
+            else:
+                confidence = "medium"
+            hrp_status = joined(status_values) or "active_hrp"
+        else:
+            confidence = "low_no_active_match"
+            hrp_status = joined(status_values) or "hrp_record_not_active"
+
+        records.append(
+            {
+                "country_iso3": iso3,
+                "has_hrp_record": True,
+                "has_active_hrp": active_count > 0,
+                "active_hrp_count": active_count,
+                "active_hrp_names": joined(active["plan_name"]) if not active.empty else "",
+                "active_hrp_codes": joined(active["plan_code"]) if not active.empty else "",
+                "active_hrp_types": joined(active["plan_type"]) if not active.empty else "",
+                "hrp_status": hrp_status,
+                "hrp_plan_name": str(chosen_first.get("plan_name", "") or ""),
+                "hrp_plan_type": str(chosen_first.get("plan_type", "") or ""),
+                "hrp_year": int(year),
+                "hrp_match_confidence": confidence,
+                "hrp_data_quality": joined(quality_values) or "matched",
+            }
         )
-        .copy()
-    )
-    summary["has_active_hrp"] = True
-    summary = any_plan.merge(summary, on="country_iso3", how="left")
-    summary["has_active_hrp"] = summary["has_active_hrp"].fillna(False)
-    summary["active_hrp_count"] = summary["active_hrp_count"].fillna(0)
-    for col in ("active_hrp_names", "active_hrp_codes", "active_hrp_types"):
-        summary[col] = summary[col].fillna("")
-    summary["hrp_status"] = summary["has_active_hrp"].map(
-        {True: "active_hrp", False: "hrp_record_not_active"}
-    )
-    return summary[columns]
+    return pd.DataFrame.from_records(records, columns=columns)
 
 
 def _summarize_sector_stress(sector_funding: pd.DataFrame, year: int) -> pd.DataFrame:
@@ -542,6 +573,8 @@ def build_rankings(
     ranked["funding_usd"] = pd.to_numeric(ranked["funding_usd"], errors="coerce")
     ranked["funding_pct"] = pd.to_numeric(ranked["funding_pct"], errors="coerce")
     ranked["cbpf_budget_usd"] = pd.to_numeric(ranked["cbpf_budget_usd"], errors="coerce").fillna(0)
+    ranked["cbpf_allocation_usd"] = ranked["cbpf_budget_usd"]
+    ranked["cbpf_allocation"] = ranked["cbpf_budget_usd"]
     ranked["cbpf_projects"] = pd.to_numeric(ranked["cbpf_projects"], errors="coerce").fillna(0)
     if "cbpf_mapping_confidence" not in ranked.columns:
         ranked["cbpf_mapping_confidence"] = pd.NA
@@ -550,7 +583,7 @@ def build_rankings(
     ranked.loc[
         ranked["cbpf_budget_usd"] > 0, "cbpf_mapping_confidence"
     ] = ranked.loc[ranked["cbpf_budget_usd"] > 0, "cbpf_mapping_confidence"].fillna(
-        "medium_alias_table"
+        "alias_match"
     )
     ranked.loc[
         ranked["cbpf_budget_usd"] > 0, "cbpf_country_source"
@@ -566,11 +599,28 @@ def build_rankings(
     if "active_hrp_count" not in ranked.columns:
         ranked["active_hrp_count"] = 0
     ranked["active_hrp_count"] = pd.to_numeric(ranked["active_hrp_count"], errors="coerce").fillna(0)
-    for col in ("active_hrp_names", "active_hrp_codes", "active_hrp_types", "hrp_status"):
+    for col in (
+        "active_hrp_names",
+        "active_hrp_codes",
+        "active_hrp_types",
+        "hrp_status",
+        "hrp_plan_name",
+        "hrp_plan_type",
+        "hrp_match_confidence",
+        "hrp_data_quality",
+    ):
         if col not in ranked.columns:
             ranked[col] = ""
         ranked[col] = ranked[col].fillna("")
-    ranked.loc[ranked["hrp_status"].eq(""), "hrp_status"] = "no_hrp_record"
+    if "hrp_year" not in ranked.columns:
+        ranked["hrp_year"] = pd.NA
+    ranked["hrp_year"] = pd.to_numeric(ranked["hrp_year"], errors="coerce").astype("Int64")
+    ranked.loc[~ranked["has_hrp_record"], "hrp_status"] = "not_matched"
+    ranked.loc[~ranked["has_hrp_record"], "hrp_match_confidence"] = "not_matched"
+    ranked.loc[~ranked["has_hrp_record"], "hrp_data_quality"] = "no_hrp_record_for_year_country"
+    ranked.loc[ranked["hrp_status"].eq(""), "hrp_status"] = "hrp_record_not_active"
+    ranked.loc[ranked["hrp_match_confidence"].eq(""), "hrp_match_confidence"] = "low_unknown"
+    ranked.loc[ranked["hrp_data_quality"].eq(""), "hrp_data_quality"] = "unknown"
     for col in (
         "population_baseline",
         "population_reference_year",
@@ -596,22 +646,27 @@ def build_rankings(
     ranked["pin_population_share"] = ranked["people_in_need"] / ranked["population_baseline"].where(
         ranked["population_baseline"] > 0
     )
-    ranked["severity_source"] = "HNO PIN / COD admin0 population baseline"
-    ranked.loc[ranked["pin_population_share"].isna(), "severity_source"] = "No local INFORM/IPC/IDP severity source matched"
+    ranked["severity_available"] = False
+    ranked["severity_source"] = "HNO PIN / COD population proxy, not INFORM or IPC severity"
     ranked["severity_scale"] = _percent_rank(ranked["pin_population_share"])
     ranked.loc[ranked["pin_population_share"].isna(), "severity_scale"] = pd.NA
     ranked["severity_rank"] = ranked["severity_scale"].rank(method="min", ascending=False)
     ranked.loc[ranked["pin_population_share"].isna(), "severity_rank"] = pd.NA
+    ranked["inform_severity_score"] = pd.NA
+    ranked["inform_severity_level"] = pd.NA
     ranked["severity_context"] = ranked.apply(
         lambda row: (
-            f"PIN is {row['pin_population_share']:.1%} of the COD admin0 population baseline."
+            f"PIN is {row['pin_population_share']:.1%} of the COD admin0 population baseline. "
+            "This is a need-scale proxy, not INFORM or IPC severity."
             if not pd.isna(row.get("pin_population_share"))
-            else "No local INFORM/IPC/IDP severity file or COD baseline matched this row."
+            else "No local INFORM/IPC/IDP severity file is available, and no COD baseline matched this row."
         ),
         axis=1,
     )
 
-    ranked["funding_gap_for_score"] = 1 - ranked["funding_pct"].clip(lower=0, upper=1)
+    ranked["funding_gap"] = 1 - ranked["funding_pct"].clip(lower=0, upper=1)
+    ranked.loc[ranked["funding_gap"].isna(), "funding_gap"] = 1.0
+    ranked["funding_gap_for_score"] = ranked["funding_gap"]
     ranked.loc[ranked["funding_gap_for_score"].isna(), "funding_gap_for_score"] = 1.0
     ranked["unmet_people_proxy"] = ranked["people_in_need"] * ranked["funding_gap_for_score"]
     ranked["cbpf_per_person_in_need"] = ranked["cbpf_budget_usd"] / ranked["people_in_need"].where(
@@ -642,6 +697,8 @@ def build_rankings(
     ranked["underfunded_years_last_3"] = ranked["underfunded_years_last_3"].fillna(0)
     ranked["observed_funding_years_last_3"] = ranked["observed_funding_years_last_3"].fillna(0)
     ranked["chronic_scale"] = ranked["underfunded_years_last_3"] / 3
+    ranked["chronic_underfunding_count"] = ranked["underfunded_years_last_3"]
+    ranked["chronic_underfunding_scale"] = ranked["chronic_scale"]
 
     ranked["overlooked_score"] = 100 * (
         0.30 * ranked["unmet_need_scale"]
@@ -652,6 +709,7 @@ def build_rankings(
     )
 
     ranked = add_country_metadata(ranked)
+    ranked["iso3"] = ranked["country_iso3"]
     ranked["data_quality_flags"] = ranked.apply(_quality_flags, axis=1)
     ranked["supplemental_data_flags"] = ranked.apply(_supplemental_flags, axis=1)
     ranked["confidence"] = ranked.apply(_confidence, axis=1)
@@ -677,6 +735,7 @@ def build_rankings(
     ordered_cols = [
         "rank",
         "country",
+        "iso3",
         "country_iso3",
         "region",
         "year",
@@ -689,6 +748,7 @@ def build_rankings(
         "requirements_usd",
         "funding_usd",
         "funding_pct",
+        "funding_gap",
         "appeal_names",
         "appeal_types",
         "has_hrp_record",
@@ -698,6 +758,13 @@ def build_rankings(
         "active_hrp_codes",
         "active_hrp_types",
         "hrp_status",
+        "hrp_plan_name",
+        "hrp_plan_type",
+        "hrp_year",
+        "hrp_match_confidence",
+        "hrp_data_quality",
+        "cbpf_allocation_usd",
+        "cbpf_allocation",
         "cbpf_budget_usd",
         "cbpf_projects",
         "cbpf_per_person_in_need",
@@ -707,10 +774,13 @@ def build_rankings(
         "population_reference_year",
         "pin_population_share",
         "population_source",
+        "severity_available",
         "severity_scale",
         "severity_rank",
         "severity_context",
         "severity_source",
+        "inform_severity_score",
+        "inform_severity_level",
         "sector_count",
         "sector_requirements_usd",
         "sector_funding_usd",
@@ -730,10 +800,16 @@ def build_rankings(
         "top_recipient",
         "top_recipient_usd",
         "top_recipient_share",
+        "need_scale",
+        "unmet_need_scale",
+        "cbpf_gap_scale",
+        "chronic_scale",
         "overlooked_score",
         "overlooked_level",
         "underfunded_years_last_3",
         "observed_funding_years_last_3",
+        "chronic_underfunding_count",
+        "chronic_underfunding_scale",
         "confidence",
         "data_quality_flags",
         "supplemental_data_flags",

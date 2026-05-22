@@ -2,96 +2,121 @@
 
 ## Objective
 
-The prototype identifies countries or crises where documented humanitarian need appears high relative to funding coverage and mapped pooled-fund support. It accepts a natural-language query or geographic scope, returns an explainable ranking, and exposes the evidence behind each row so an analyst can check whether the result is a credible follow-up lead.
+Geo-Insight ranks crises where documented humanitarian need is high relative to funding coverage and mapped pooled-fund support. The prototype accepts a natural-language query or geographic scope, converts supported language into reproducible filters, and returns an auditable ranking with explanations and data-quality flags.
 
-The tool is designed as a triage aid. It does not make automated funding recommendations.
+The intended user is a humanitarian analyst, donor advisor, or coordination officer. The output should prioritize review and source inspection. It should not be treated as an automated allocation decision.
 
-## Data Used
+## Gap Score Definition
 
-The current pipeline uses these public OCHA/HDX sources and locally downloaded supplements:
-
-- Humanitarian Needs Overview files for 2024, 2025, and 2026 people-in-need estimates.
-- FTS global requirements and funding data for plan funding coverage.
-- Humanitarian Response Plans metadata for plan status and active HRP checks.
-- OCHA CBPF Project Summary data for mapped country-based pooled-fund allocations.
-- COD admin0 population data for people-in-need share context.
-- FTS global-cluster funding data for lowest-funded sector context.
-- FTS incoming and outgoing flow-detail files for single-country flow concentration context.
-
-The dashboard and CSV output now include HRP fields (`has_active_hrp`, `active_hrp_names`, `hrp_status`), CBPF mapping fields (`cbpf_mapping_confidence`, `cbpf_country_source`), and supplemental evidence fields for population, sector coverage, and flow concentration.
-
-No local INFORM Severity Index, IPC, or IDP/displacement file is cached in this repo. Severity-related views therefore use only the transparent local proxy `HNO people_in_need / COD admin0 population baseline`, labelled as `severity_context`. It is not treated as an INFORM replacement and is not added to the scoring formula.
-
-## Gap Definition
-
-The score combines five auditable signals:
+The score combines five transparent signals:
 
 ```text
 overlooked_score =
-  0.30 * percentile(log(people_in_need * funding_gap))
+  0.30 * unmet_need_scale
 + 0.25 * funding_gap
-+ 0.20 * percentile(log(people_in_need))
-+ 0.15 * inverse_percentile(CBPF allocation per person in need)
-+ 0.10 * share of latest three years below 40 percent funding
++ 0.20 * need_scale
++ 0.15 * cbpf_gap_scale
++ 0.10 * chronic_underfunding_scale
 ```
 
-Where `funding_gap = 1 - funding_pct`, and `funding_pct` comes from matched FTS funding divided by stated requirements. The score is reported with a coarse level: Watch, Moderate, High, or Very High.
+Where:
 
-Supplemental fields explain the ranking but do not alter the score. This keeps the result stable and avoids implying precision from incomplete optional sources.
+- `funding_gap = 1 - funding_pct`
+- `funding_pct` is matched FTS funding divided by requirements.
+- `unmet_need_scale` is the percentile rank of `log(people_in_need * funding_gap)`.
+- `need_scale` is the percentile rank of `log(people_in_need)`.
+- `cbpf_gap_scale` is higher where mapped CBPF allocation per person in need is lower.
+- `chronic_underfunding_scale` is the share of the latest three observed years below 40 percent funding coverage.
 
-## Handling Missing and Inconsistent Data
+The formula intentionally favors auditable features over opaque prediction.
 
-The system avoids summing sector-level people-in-need because sector PIN values can overlap. It uses an intersectoral or plan-caseload PIN when available, otherwise the maximum reported PIN for the country and year.
+## Data Handling
 
-Rows with no matched FTS requirements are retained and flagged as `missing_fts_requirements`. Rows with no mapped CBPF allocation are flagged as `no_mapped_cbpf_allocation`.
+HNO people-in-need values are the primary need signal. The system avoids summing sector PIN because sector populations can overlap. It uses intersectoral or plan-caseload PIN when available, otherwise the maximum reported country PIN.
 
-CBPF country mapping is based on pooled-fund-name aliases, so mapped rows are labelled `medium_alias_table`. Detected unmapped pooled-fund records are exported to `data/processed/unmapped_cbpf_funds.csv`.
+Rows with missing FTS requirements are retained and flagged as `missing_fts_requirements`. The ranking should surface uncertainty instead of silently dropping cases that need follow-up.
 
-Shared multi-country FTS flow-detail rows are excluded from concentration metrics. Only `onBoundary=single` and `status in {paid, commitment}` records are used, which avoids assigning the same regional amount to multiple countries.
+CBPF allocations are mapped from `pooledfundname` to ISO3 with the local country alias table. Successful mapped rows receive `cbpf_mapping_confidence=alias_match`; rows without mapped allocation keep zero allocation and receive `no_mapped_cbpf_allocation`. Unmapped pooled-fund records are exported to `data/processed/unmapped_cbpf_funds.csv`.
 
-## Query Handling
+Shared multi-country FTS flow-detail rows are excluded from concentration metrics. Only `onBoundary=single` and `status in {paid, commitment}` records are used.
 
-The query parser remains rule-based for reproducibility. It extracts:
+## Query Parser
+
+The rule-based parser extracts:
 
 - year
-- region or country scope
+- region and country scope
 - sector keyword
-- funding threshold, including phrases such as "less than 40%" and "no funding"
-- active HRP, any HRP, or no HRP filters
-- severity, food insecurity, and displacement query intent
+- funding threshold, including "less than 40%" and "no funding"
+- active HRP and missing HRP filters
+- food-insecurity query intent
+- structural-neglect or chronic-underfunding intent
 - minimum people-in-need threshold
 
-Food-insecurity wording maps to the food sector where the HNO file contains a food-related sector. Severity and displacement terms are surfaced in the query audit, but they do not create unsupported filters when no authoritative local severity or displacement dataset exists.
+Supported examples:
 
-The dashboard includes an "Interpreted query filters" panel so users can see exactly which parts of the query became filters and which terms remained analyst context.
+- `active HRPs with less than 40% funding coverage` maps to `hrp_filter=active` and `funding_pct_max=0.40`.
+- `Countries with no HRP` maps to `hrp_filter=missing`.
+- `Show acute food insecurity hotspots with less than 10% requested funding.` maps to food-sector proxy plus `funding_pct_max=0.10`.
+- `Which regions are consistently underfunded across multiple years?` sets structural-neglect intent. It does not hard-code a result set.
+
+Food-insecurity wording is a sector proxy only. No IPC phase data is used in the current prototype.
+
+## HRP Metadata
+
+HRP metadata is merged by selected year and country ISO3. The output includes:
+
+- `has_active_hrp`
+- `hrp_status`
+- `hrp_plan_name`
+- `hrp_plan_type`
+- `hrp_year`
+- `hrp_match_confidence`
+- `hrp_data_quality`
+
+The code prioritizes an HRP status field if one exists. The current local `humanitarian-response-plans.csv` file has no explicit status field, so active status is inferred from `startDate`, `endDate`, and `years`. Such matches are labelled `medium_date_inferred` and `matched_by_year_and_date_no_status_field`.
+
+Countries with documented need are not removed if HRP is missing. `hrp_filter=missing` keeps rows with no active HRP match.
+
+## Severity and Need Context
+
+No local INFORM Severity Index, IPC, or IDP/displacement dataset is cached in this repo. The generated ranking files therefore set:
+
+- `severity_available=False`
+- `severity_source=HNO PIN / COD population proxy, not INFORM or IPC severity`
+
+When COD admin0 population is available, `severity_context` describes people in need as a share of the population baseline. This is a need-scale context field, not a formal severity score, and it is not added to the ranking formula.
+
+## Structural Neglect
+
+Structural neglect is represented by chronic underfunding. The pipeline checks the selected year and two previous years, then counts how many observed years had FTS funding coverage below 40 percent. The output exposes both `chronic_underfunding_count` and `chronic_underfunding_scale`.
 
 ## Dashboard Evidence
 
-The dashboard now has four working views:
+The Streamlit dashboard exposes:
 
-- `Command View`: ranking table, HRP status, severity context, CBPF mapping confidence, and top-row explanations.
-- `Interactive Map`: map-ready crisis points with hover details for funding coverage, PIN share, HRP status, CBPF allocation, sector stress, and data flags.
-- `Comparison Board`: evidence matrix, score ladder, CBPF intensity, regional load, region-level matrix, lowest-sector coverage, PIN share, flow concentration, and a 2024-2026 funding-coverage trend chart.
-- `Method & Data`: filtered result audit, guardrails, triggered data cautions, scoring formula, evidence trace, flag counts, confidence distribution, and full CSV-ready output.
+- ranked table and top-result explanation
+- map-ready country points
+- funding coverage and funding gap
+- HRP status and match confidence
+- CBPF allocation, per-person allocation, and mapping confidence
+- worst-funded sector context
+- chronic underfunding count
+- severity context and source
+- data-quality flags and confidence
 
-## Validation Snapshot
+Missing optional fields are handled with graceful fallbacks.
 
-For the query `Which crises have less than 40% funding coverage?`, the generated CSVs contain:
+## Failure Cases and Limitations
 
-- 2024: 7 matched crises; top result Ethiopia; 4 `ok` rows and 3 `no_mapped_cbpf_allocation` rows.
-- 2025: 18 matched crises; top result Colombia; 14 `ok` rows and 4 `no_mapped_cbpf_allocation` rows.
-- 2026: 19 matched crises; top result Yemen; 12 `ok` rows and 7 `no_mapped_cbpf_allocation` rows.
+- Funding can lag needs assessments, especially early in a year.
+- Regional appeals and multi-country plans can be difficult to attribute to single countries.
+- CBPF is only one pooled-fund lens, not total humanitarian financing.
+- HRP active status is medium-confidence date inference when the source file lacks explicit status.
+- Food-insecurity queries do not use IPC data.
+- Severity context is not real INFORM, IPC, or IDP severity.
+- Data gaps should trigger analyst review, not force precise decisions.
 
-All matched rows in those three query outputs have active HRP records according to the local HRP metadata and selected plan year. Detailed checks are in `docs/validation.md`.
+## Analyst Workflow
 
-## Failure Cases
-
-- Funding can lag needs assessments; a low current-year funding percentage early in the year may not mean long-term neglect.
-- Regional and multi-country appeals can be difficult to attribute to individual countries.
-- CBPF coverage is not total humanitarian financing; it is only a pooled-fund lens.
-- The local severity context is a PIN-share measure, not an external severity index.
-- Data gaps should lower confidence or trigger follow-up, not force precise conclusions.
-
-## Intended Workflow
-
-A humanitarian coordinator, donor advisor, or analyst can use the tool to generate a first-pass list of crises that deserve deeper review. The ranked output should be followed by source inspection, operational context review, and country or sector expert validation.
+An analyst should use the ranking as a first-pass shortlist, inspect the source fields and flags, compare FTS/HNO/HRP context, and then validate the result with country or sector expertise before drawing operational conclusions.

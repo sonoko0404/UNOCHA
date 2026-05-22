@@ -167,7 +167,8 @@ def summarize_need(hno: pd.DataFrame, *, sector: str | None = None) -> pd.DataFr
                 selections[selected] = f"sector:{sector}:subnational_max_record"
             selected_idx.append(selected)
         idx = pd.Index(selected_idx)
-        work["need_selection"] = work.index.map(selections).fillna(work["need_selection"])
+        selection_series = pd.Series(work.index.map(selections), index=work.index)
+        work["need_selection"] = selection_series.fillna(work["need_selection"])
     else:
         overall_pattern = (
             "intersectoral|inter-sector|multi sector|multi-sector|overall|total|plan caseload"
@@ -191,7 +192,8 @@ def summarize_need(hno: pd.DataFrame, *, sector: str | None = None) -> pd.DataFr
                     selections[selected] = "max_reported_pin_no_intersectoral"
             selected_idx.append(selected)
         idx = pd.Index(selected_idx)
-        work["need_selection"] = work.index.map(selections).fillna("")
+        selection_series = pd.Series(work.index.map(selections), index=work.index)
+        work["need_selection"] = selection_series.fillna("")
 
     summary = work.loc[idx].copy()
     summary = summary.rename(columns={"in_need": "people_in_need"})
@@ -484,36 +486,73 @@ def normalize_hrp(path: Path) -> pd.DataFrame:
         return df
     if "locations" not in df.columns:
         return pd.DataFrame()
-    records = []
-    for _, row in df.iterrows():
-        year_values = re.findall(r"\b20\d{2}\b", str(row.get("years", "")))
-        locations = split_iso_codes(row.get("locations"))
+
+    status_candidates = [
+        "status",
+        "plan_status",
+        "publication_status",
+        "workflow_status",
+        "state",
+    ]
+
+    def infer_status(row: pd.Series, year_int: int) -> tuple[bool, str, str, str]:
+        raw_status = ""
+        for col in status_candidates:
+            if col in row.index and str(row.get(col, "") or "").strip():
+                raw_status = str(row.get(col, "") or "").strip()
+                break
+
+        status_text = raw_status.lower()
+        if re.search(r"\b(closed|inactive|archived|cancelled|canceled|expired)\b", status_text):
+            return False, raw_status, "status_not_active", "matched_by_status_field"
+        if re.search(r"\b(active|published|ongoing|current|open)\b", status_text):
+            return True, raw_status, "status_active", "matched_by_status_field"
+
         start_date = str(row.get("startdate", "") or "")
         end_date = str(row.get("enddate", "") or "")
         start = pd.to_datetime(start_date, errors="coerce")
         end = pd.to_datetime(end_date, errors="coerce")
+        if not pd.isna(start) and not pd.isna(end):
+            year_start = pd.Timestamp(year_int, 1, 1)
+            year_end = pd.Timestamp(year_int, 12, 31)
+            is_active = bool(start <= year_end and end >= year_start)
+            if is_active:
+                if raw_status:
+                    return True, raw_status, "active_date_overlap_status_unclear", "matched_by_date_status_unclear"
+                return True, "date_overlap_no_status_field", "active_date_overlap_no_status_field", "matched_by_year_and_date_no_status_field"
+            if raw_status:
+                return False, raw_status, "not_active_by_date_status_unclear", "matched_by_date_status_unclear"
+            return False, "date_not_overlapping_no_status_field", "not_active_by_date_no_status_field", "matched_by_year_and_date_no_status_field"
+
+        if raw_status:
+            return False, raw_status, "unknown_status_value", "status_unrecognized"
+        return False, "no_status_or_dates", "unknown_status_no_dates", "no_status_or_dates"
+
+    records = []
+    for _, row in df.iterrows():
+        year_values = re.findall(r"\b20\d{2}\b", str(row.get("years", "")))
+        locations = split_iso_codes(row.get("locations"))
         categories = str(row.get("categories", "") or "")
         plan_type = categories.split("|")[0].strip() if categories else ""
         for iso3 in locations:
             for year in year_values:
                 year_int = int(year)
-                year_start = pd.Timestamp(year_int, 1, 1)
-                year_end = pd.Timestamp(year_int, 12, 31)
-                if pd.isna(start) or pd.isna(end):
-                    is_active = True
-                else:
-                    is_active = bool(start <= year_end and end >= year_start)
+                is_active, raw_status, normalized_status, quality = infer_status(row, year_int)
                 records.append(
                     {
                         "country_iso3": iso3,
                         "year": year_int,
+                        "hrp_year": year_int,
                         "plan_code": row.get("code", ""),
                         "plan_name": row.get("planversion", ""),
                         "plan_type": plan_type,
                         "plan_categories": categories,
                         "start_date": row.get("startdate", ""),
                         "end_date": row.get("enddate", ""),
+                        "hrp_status_raw": raw_status,
+                        "hrp_status_normalized": normalized_status,
                         "hrp_is_active": is_active,
+                        "hrp_data_quality": quality,
                     }
                 )
     return pd.DataFrame.from_records(records)
@@ -572,7 +611,7 @@ def normalize_cbpf(path: Path) -> pd.DataFrame:
         .agg(cbpf_budget_usd=("cbpf_budget_usd", "sum"), cbpf_projects=(fund_col, "count"))
         .copy()
     )
-    grouped["cbpf_mapping_confidence"] = "medium_alias_table"
+    grouped["cbpf_mapping_confidence"] = "alias_match"
     grouped["cbpf_country_source"] = "pooledfundname_alias_table"
     return grouped
 
