@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+data/raw/*.part
+data/raw/*.csv
+data/raw/*.xlsx
+data/raw/manifest.json
+data/processed/*.csv
