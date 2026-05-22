@@ -24,6 +24,11 @@ class QuerySpec:
     sector: str | None = None
     funding_pct_max: float | None = None
     min_people_in_need: int = DEFAULT_MIN_PEOPLE_IN_NEED
+    hrp_filter: str | None = None
+    severity_requested: bool = False
+    food_insecurity_requested: bool = False
+    displacement_requested: bool = False
+    unparsed_terms: list[str] = field(default_factory=list)
 
 
 def _parse_percent_threshold(text: str) -> float | None:
@@ -36,7 +41,7 @@ def _parse_percent_threshold(text: str) -> float | None:
         match = re.search(pattern, text, flags=re.I)
         if match:
             return float(match.group(1)) / 100.0
-    if re.search(r"\b(absent|negligible|unfunded)\b", text, flags=re.I):
+    if re.search(r"\b(absent|negligible|unfunded|no funding|without funding)\b", text, flags=re.I):
         return 0.10
     return None
 
@@ -73,6 +78,8 @@ def _parse_sector(text: str) -> str | None:
     for alias, sector in sorted(SECTOR_ALIASES.items(), key=lambda item: len(item[0]), reverse=True):
         if alias in lower:
             return sector
+    if "acute food insecurity" in lower:
+        return "food"
     return None
 
 
@@ -89,9 +96,108 @@ def _parse_countries(text: str) -> set[str]:
     return countries
 
 
+def _parse_hrp_filter(text: str) -> str | None:
+    lower = text.lower()
+    if re.search(r"\b(no|without|missing)\s+(?:active\s+)?(?:hrp|humanitarian response plan|response plan)", lower):
+        return "missing"
+    if re.search(r"\bactive\s+(?:hrp|humanitarian response plan|response plan)s?\b", lower):
+        return "active"
+    if re.search(r"\b(?:hrp|humanitarian response plan|response plan)s?\b", lower):
+        return "any"
+    return None
+
+
+def _parse_severity_requested(text: str) -> bool:
+    return bool(re.search(r"\b(severity|severe|urgent|urgency|inform)\b", text, flags=re.I))
+
+
+def _parse_food_insecurity_requested(text: str) -> bool:
+    return bool(re.search(r"\b(acute food insecurity|food insecurity|ipc)\b", text, flags=re.I))
+
+
+def _parse_displacement_requested(text: str) -> bool:
+    return bool(re.search(r"\b(displacement|displaced|idp|idps|refugee|refugees)\b", text, flags=re.I))
+
+
+def _unparsed_terms(text: str, spec: QuerySpec) -> list[str]:
+    lower = text.lower()
+    recognized_phrases = set(REGION_SCOPES) | set(SECTOR_ALIASES) | {
+        "active",
+        "hrp",
+        "hrps",
+        "humanitarian",
+        "response",
+        "plan",
+        "plans",
+        "less",
+        "than",
+        "under",
+        "below",
+        "funding",
+        "funded",
+        "coverage",
+        "people",
+        "need",
+        "minimum",
+        "min",
+        "million",
+        "thousand",
+        "severity",
+        "severe",
+        "inform",
+        "food",
+        "insecurity",
+        "acute",
+        "displacement",
+        "displaced",
+        "idp",
+        "idps",
+        "refugee",
+        "refugees",
+        "countries",
+        "country",
+        "crises",
+        "crisis",
+        "show",
+        "which",
+        "with",
+        "have",
+        "has",
+        "and",
+        "or",
+        "the",
+        "are",
+        "but",
+        "not",
+        "currently",
+        "top",
+        "gap",
+        "requested",
+        "cbpf",
+        "high",
+        "low",
+    }
+    for alias in COUNTRY_ALIASES:
+        recognized_phrases.update(alias.lower().split())
+    for region in REGION_SCOPES:
+        if region in lower:
+            recognized_phrases.update(region.split())
+    for alias in SECTOR_ALIASES:
+        if alias in lower:
+            recognized_phrases.update(alias.split())
+
+    tokens = re.findall(r"[a-zA-Z][a-zA-Z-]{2,}", lower)
+    leftovers = []
+    for token in tokens:
+        clean = token.replace("-", " ")
+        if token not in recognized_phrases and clean not in recognized_phrases:
+            leftovers.append(token)
+    return sorted(set(leftovers))
+
+
 def parse_query(raw_query: str | None) -> QuerySpec:
     text = raw_query or ""
-    return QuerySpec(
+    spec = QuerySpec(
         raw_query=text,
         year=_parse_year(text),
         region=_parse_region(text),
@@ -99,4 +205,12 @@ def parse_query(raw_query: str | None) -> QuerySpec:
         sector=_parse_sector(text),
         funding_pct_max=_parse_percent_threshold(text),
         min_people_in_need=_parse_min_people_in_need(text),
+        hrp_filter=_parse_hrp_filter(text),
+        severity_requested=_parse_severity_requested(text),
+        food_insecurity_requested=_parse_food_insecurity_requested(text),
+        displacement_requested=_parse_displacement_requested(text),
     )
+    if spec.food_insecurity_requested and spec.sector is None:
+        spec.sector = "food"
+    spec.unparsed_terms = _unparsed_terms(text, spec)
+    return spec

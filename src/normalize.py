@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from .config import COUNTRY_ALIASES, COUNTRY_REFERENCE, RAW_DIR
+from .config import COUNTRY_ALIASES, COUNTRY_REFERENCE, PROCESSED_DIR, RAW_DIR
 
 
 def clean_column(name: object) -> str:
@@ -486,19 +486,34 @@ def normalize_hrp(path: Path) -> pd.DataFrame:
         return pd.DataFrame()
     records = []
     for _, row in df.iterrows():
-        years = split_iso_codes(row.get("years"))
         year_values = re.findall(r"\b20\d{2}\b", str(row.get("years", "")))
         locations = split_iso_codes(row.get("locations"))
+        start_date = str(row.get("startdate", "") or "")
+        end_date = str(row.get("enddate", "") or "")
+        start = pd.to_datetime(start_date, errors="coerce")
+        end = pd.to_datetime(end_date, errors="coerce")
+        categories = str(row.get("categories", "") or "")
+        plan_type = categories.split("|")[0].strip() if categories else ""
         for iso3 in locations:
             for year in year_values:
+                year_int = int(year)
+                year_start = pd.Timestamp(year_int, 1, 1)
+                year_end = pd.Timestamp(year_int, 12, 31)
+                if pd.isna(start) or pd.isna(end):
+                    is_active = True
+                else:
+                    is_active = bool(start <= year_end and end >= year_start)
                 records.append(
                     {
                         "country_iso3": iso3,
-                        "year": int(year),
+                        "year": year_int,
                         "plan_code": row.get("code", ""),
                         "plan_name": row.get("planversion", ""),
+                        "plan_type": plan_type,
+                        "plan_categories": categories,
                         "start_date": row.get("startdate", ""),
                         "end_date": row.get("enddate", ""),
+                        "hrp_is_active": is_active,
                     }
                 )
     return pd.DataFrame.from_records(records)
@@ -508,7 +523,16 @@ def normalize_cbpf(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path, dtype=str, low_memory=False)
     df.columns = [clean_column(col) for col in df.columns]
     if df.empty:
-        return pd.DataFrame(columns=["country_iso3", "year", "cbpf_budget_usd", "cbpf_projects"])
+        return pd.DataFrame(
+            columns=[
+                "country_iso3",
+                "year",
+                "cbpf_budget_usd",
+                "cbpf_projects",
+                "cbpf_mapping_confidence",
+                "cbpf_country_source",
+            ]
+        )
 
     year_col = "allocationyear"
     fund_col = "pooledfundname"
@@ -525,12 +549,31 @@ def normalize_cbpf(path: Path) -> pd.DataFrame:
         )
         df = df[~management_mask].copy()
 
+    unmapped = df[df["country_iso3"].isna()].copy()
+    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+    if not unmapped.empty:
+        unmapped_summary = (
+            unmapped.groupby([fund_col, "year"], dropna=False, as_index=False)
+            .agg(
+                unmapped_cbpf_budget_usd=("cbpf_budget_usd", "sum"),
+                unmapped_cbpf_records=(fund_col, "size"),
+            )
+            .sort_values(["year", "unmapped_cbpf_budget_usd"], ascending=[False, False])
+        )
+        unmapped_summary.to_csv(PROCESSED_DIR / "unmapped_cbpf_funds.csv", index=False)
+    else:
+        pd.DataFrame(
+            columns=[fund_col, "year", "unmapped_cbpf_budget_usd", "unmapped_cbpf_records"]
+        ).to_csv(PROCESSED_DIR / "unmapped_cbpf_funds.csv", index=False)
+
     mapped = df.dropna(subset=["country_iso3", "year"]).copy()
     grouped = (
         mapped.groupby(["country_iso3", "year"], as_index=False)
         .agg(cbpf_budget_usd=("cbpf_budget_usd", "sum"), cbpf_projects=(fund_col, "count"))
         .copy()
     )
+    grouped["cbpf_mapping_confidence"] = "medium_alias_table"
+    grouped["cbpf_country_source"] = "pooledfundname_alias_table"
     return grouped
 
 

@@ -19,7 +19,7 @@ Checked on 2026-05-21.
 | FTS global-cluster funding | HDX package `global-requirements-and-funding-data` | Local CSV downloaded | `fts_requirements_funding_globalcluster_global.csv` supplies lowest-funded sector context |
 | FTS incoming flow detail | HDX package `global-requirements-and-funding-data` | Local CSV downloaded | `fts_incoming_funding_global.csv` supplies single-country donor concentration context |
 | FTS outgoing flow detail | HDX package `global-requirements-and-funding-data` | Local CSV downloaded | `fts_outgoing_funding_global.csv` supplies single-country recipient concentration context |
-| INFORM Severity Index | HDX CKAN package `inform-global-crisis-severity-index` | Metadata verified | Downloader supports optional fetch |
+| INFORM Severity Index | HDX CKAN package `inform-global-crisis-severity-index` | Metadata verified, no local file cached | Not used in current score or dashboard because no local INFORM/IPC/IDP data file is present |
 | HDX HAPI | `https://hapi.humdata.org/` | Documentation/API reachable outside sandbox | Not used in v1; CKAN CSV downloads are simpler |
 
 ## Local supplement files used after 2026-05-21 update
@@ -42,3 +42,6 @@ Checked on 2026-05-21.
 - CBPF data is large enough that it should be cached locally. The current script downloads it once and reuses the cached CSV.
 - ReliefWeb links in the challenge are reference/example documents rather than required structured datasets. They are not part of the v1 scoring pipeline.
 - Shared multi-country FTS flow-detail rows are excluded from concentration metrics because allocating the same regional amount to every destination would inflate country totals.
+- HRP active status is inferred from `startDate`, `endDate`, and selected plan year in the HRP metadata. It is surfaced as `has_active_hrp`, `active_hrp_names`, and `hrp_status`.
+- Need-intensity severity context is computed only where COD population baselines match a row. It uses `HNO people_in_need / COD admin0 population` and is labeled as local context, not as an INFORM severity index.
+- CBPF country mapping uses the pooled-fund-name alias table. Rows with mapped CBPF allocation receive `cbpf_mapping_confidence=medium_alias_table`; detected unmapped CBPF funds are written to `data/processed/unmapped_cbpf_funds.csv`.

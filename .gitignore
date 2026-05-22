@@ -7,3 +7,10 @@ data/raw/*.csv
 data/raw/*.xlsx
 data/raw/manifest.json
 data/processed/*.csv
+!data/processed/ranking_2024.csv
+!data/processed/ranking_2025.csv
+!data/processed/ranking_2026.csv
+!data/processed/ranking_2024_enriched.csv
+!data/processed/ranking_2025_enriched.csv
+!data/processed/ranking_2026_enriched.csv
+!data/processed/unmapped_cbpf_funds.csv

@@ -3,13 +3,24 @@
 from __future__ import annotations
 
 import html
+import importlib
+from pathlib import Path
 
 import altair as alt
 import pandas as pd
 import pydeck as pdk
 import streamlit as st
 
-from src.scoring import MissingRawDataError, build_rankings
+import src.normalize as normalize_module
+import src.query as query_module
+import src.scoring as scoring_module
+
+normalize_module = importlib.reload(normalize_module)
+query_module = importlib.reload(query_module)
+scoring_module = importlib.reload(scoring_module)
+MissingRawDataError = scoring_module.MissingRawDataError
+build_rankings = scoring_module.build_rankings
+parse_query = query_module.parse_query
 
 
 LEVEL_ORDER = ["Very High", "High", "Moderate", "Watch"]
@@ -25,6 +36,7 @@ LEVEL_HEX = {
     "Moderate": "#cfa93e",
     "Watch": "#327671",
 }
+PROJECT_ROOT = Path(__file__).resolve().parent
 
 
 def fmt_num(value: float | int | None) -> str:
@@ -409,6 +421,15 @@ def prepare_display_data(df: pd.DataFrame) -> pd.DataFrame:
         "top_recipient",
         "top_recipient_share",
         "supplemental_data_flags",
+        "has_active_hrp",
+        "active_hrp_names",
+        "hrp_status",
+        "severity_scale",
+        "severity_rank",
+        "severity_context",
+        "severity_source",
+        "cbpf_mapping_confidence",
+        "cbpf_country_source",
     ]
     for col in optional_cols:
         if col not in work.columns:
@@ -431,6 +452,8 @@ def prepare_display_data(df: pd.DataFrame) -> pd.DataFrame:
     work["outgoing_total_label"] = work["outgoing_total_usd"].map(fmt_money)
     work["top_recipient_label"] = work["top_recipient"].fillna("n/a").astype(str)
     work["top_recipient_share_label"] = work["top_recipient_share"].map(fmt_pct)
+    work["active_hrp_label"] = work["has_active_hrp"].map(lambda value: "yes" if bool(value) else "no")
+    work["severity_scale_label"] = work["severity_scale"].map(fmt_pct)
     work["level_color"] = work["overlooked_level"].map(lambda level: LEVEL_COLORS.get(level, [80, 80, 80, 160]))
     work["level_hex"] = work["overlooked_level"].map(lambda level: LEVEL_HEX.get(level, "#777777"))
     work["map_radius"] = (work["people_in_need"].clip(lower=100_000).pow(0.5) * 85).clip(75_000, 850_000)
@@ -475,6 +498,42 @@ def method_card(label: str, value: str, note: str) -> str:
         f'<div class="method-card-note">{html.escape(note)}</div>'
         "</div>"
     )
+
+
+def render_query_audit(query: str, selected_year: int, min_people: int) -> None:
+    spec = parse_query(query)
+    hrp_filter = getattr(spec, "hrp_filter", None)
+    severity_requested = bool(getattr(spec, "severity_requested", False))
+    unparsed_terms = getattr(spec, "unparsed_terms", [])
+    cards = [
+        method_card("Parsed year", str(selected_year), f"Query text year: {spec.year}; sidebar year takes precedence."),
+        method_card("Parsed region", spec.region or "All regions", "Region aliases are rule-based."),
+        method_card(
+            "Parsed countries",
+            ", ".join(sorted(spec.countries)) if spec.countries else "All matched countries",
+            "Country names and ISO3 codes are matched against the local alias table.",
+        ),
+        method_card("Parsed sector", spec.sector or "All sectors", "Food insecurity queries map to the food sector when present."),
+        method_card(
+            "Funding ceiling",
+            fmt_pct(spec.funding_pct_max) if spec.funding_pct_max is not None else "None",
+            "'No funding', 'unfunded', and 'negligible' are treated as <=10%.",
+        ),
+        method_card("Minimum PIN", fmt_num(min_people), "Sidebar minimum people-in-need takes precedence."),
+        method_card("HRP filter", hrp_filter or "None", "Supports active HRP, no HRP, and response plan wording."),
+        method_card(
+            "Severity terms",
+            "requested" if severity_requested else "not requested",
+            "Local severity context uses HNO PIN / COD population; no INFORM/IPC/IDP file is cached.",
+        ),
+        method_card(
+            "Unparsed terms",
+            ", ".join(unparsed_terms) if unparsed_terms else "None",
+            "These words were not converted into filters and remain analyst context.",
+        ),
+    ]
+    with st.expander("Interpreted query filters", expanded=bool(query.strip())):
+        st.markdown(f'<div class="method-grid">{"".join(cards)}</div>', unsafe_allow_html=True)
 
 
 def render_hero(year: int, query: str, matched: int) -> None:
@@ -621,6 +680,8 @@ def render_map(df: pd.DataFrame) -> None:
                 "Rank: #{rank}<br/>"
                 "People in need: {people_label}<br/>"
                 "PIN / COD population: {pin_population_share_label}<br/>"
+                "Active HRP: {active_hrp_label}<br/>"
+                "Severity context: {severity_scale_label}<br/>"
                 "Funding coverage: {funding_pct_label}<br/>"
                 "Lowest sector coverage: {worst_sector_label} ({worst_sector_funding_label})<br/>"
                 "CBPF allocation: {cbpf_label}<br/>"
@@ -647,11 +708,14 @@ def render_ranking_table(df: pd.DataFrame) -> None:
         "country",
         "region",
         "people_in_need",
+        "has_active_hrp",
         "funding_pct",
         "pin_population_share",
+        "severity_scale",
         "worst_sector",
         "worst_sector_funding_pct",
         "cbpf_budget_usd",
+        "cbpf_mapping_confidence",
         "cbpf_per_person_in_need",
         "top_recipient",
         "top_recipient_share",
@@ -667,6 +731,7 @@ def render_ranking_table(df: pd.DataFrame) -> None:
                 "people_in_need": "{:,.0f}",
                 "funding_pct": "{:.1%}",
                 "pin_population_share": "{:.1%}",
+                "severity_scale": "{:.1%}",
                 "worst_sector_funding_pct": "{:.1%}",
                 "cbpf_budget_usd": "${:,.0f}",
                 "cbpf_per_person_in_need": "${:,.2f}",
@@ -677,6 +742,35 @@ def render_ranking_table(df: pd.DataFrame) -> None:
         width="stretch",
         hide_index=True,
     )
+
+
+@st.cache_data(show_spinner=False)
+def build_country_trend(country_iso3: str) -> pd.DataFrame:
+    rows = []
+    for trend_year in (2024, 2025, 2026):
+        cached_path = PROJECT_ROOT / "data" / "processed" / f"ranking_{trend_year}_enriched.csv"
+        if cached_path.exists() and cached_path.stat().st_size > 0:
+            trend = pd.read_csv(cached_path)
+        else:
+            trend = build_rankings("", year=trend_year, min_people_in_need=0)
+        match = trend[trend["country_iso3"] == country_iso3].copy()
+        if match.empty:
+            rows.append({"year": trend_year, "country_iso3": country_iso3})
+        else:
+            row = match.iloc[0].to_dict()
+            rows.append(
+                {
+                    "year": trend_year,
+                    "country_iso3": country_iso3,
+                    "country": row.get("country"),
+                    "funding_pct": row.get("funding_pct"),
+                    "people_in_need": row.get("people_in_need"),
+                    "overlooked_score": row.get("overlooked_score"),
+                    "underfunded_years_last_3": row.get("underfunded_years_last_3"),
+                    "has_active_hrp": row.get("has_active_hrp"),
+                }
+            )
+    return pd.DataFrame(rows)
 
 
 def render_charts(df: pd.DataFrame, top_n: int) -> None:
@@ -1011,6 +1105,77 @@ def render_charts(df: pd.DataFrame, top_n: int) -> None:
         )
         st.altair_chart(flow_chart, width="stretch")
 
+    st.markdown(
+        """
+        <section class="board-panel">
+          <div class="board-kicker">Temporal neglect check</div>
+          <div class="board-title">Funding coverage trend for a selected crisis</div>
+          <div class="board-copy">
+            This chart compares 2024, 2025, and 2026 FTS funding coverage for one country.
+            It helps distinguish a chronic underfunding pattern from a one-year coverage shock.
+          </div>
+        </section>
+        """,
+        unsafe_allow_html=True,
+    )
+    country_options = chart_df[["country_iso3", "country"]].drop_duplicates().copy()
+    selected_iso = st.selectbox(
+        "Trend country",
+        country_options["country_iso3"].tolist(),
+        format_func=lambda iso: country_options.set_index("country_iso3").loc[iso, "country"],
+    )
+    trend_df = build_country_trend(selected_iso)
+    if trend_df["funding_pct"].notna().sum() == 0:
+        st.info("No three-year FTS coverage trend is available for this country.")
+    else:
+        trend_chart = (
+            alt.Chart(trend_df)
+            .mark_line(point=True, strokeWidth=3, color="#005a8c")
+            .encode(
+                x=alt.X("year:O", title="Year"),
+                y=alt.Y(
+                    "funding_pct:Q",
+                    title="Funding coverage",
+                    axis=alt.Axis(format="%"),
+                    scale=alt.Scale(domain=[0, max(1.0, float(trend_df["funding_pct"].max(skipna=True) or 1.0))]),
+                ),
+                tooltip=[
+                    alt.Tooltip("year:O"),
+                    alt.Tooltip("country:N"),
+                    alt.Tooltip("funding_pct:Q", title="Funding coverage", format=".1%"),
+                    alt.Tooltip("people_in_need:Q", title="People in need", format=",.0f"),
+                    alt.Tooltip("overlooked_score:Q", title="Score", format=".1f"),
+                    alt.Tooltip("has_active_hrp:N", title="Active HRP"),
+                ],
+            )
+        )
+        chronic_rule = (
+            alt.Chart(pd.DataFrame({"funding_pct": [0.4]}))
+            .mark_rule(color="#c63a3a", strokeDash=[6, 5], size=2)
+            .encode(y="funding_pct:Q")
+        )
+        st.altair_chart((trend_chart + chronic_rule).properties(height=320), width="stretch")
+        st.dataframe(
+            trend_df[
+                [
+                    "year",
+                    "country",
+                    "funding_pct",
+                    "people_in_need",
+                    "overlooked_score",
+                    "has_active_hrp",
+                ]
+            ].style.format(
+                {
+                    "funding_pct": "{:.1%}",
+                    "people_in_need": "{:,.0f}",
+                    "overlooked_score": "{:.1f}",
+                }
+            ),
+            width="stretch",
+            hide_index=True,
+        )
+
 
 def flag_count(df: pd.DataFrame, flag: str) -> int:
     return int(df["data_quality_flags"].fillna("").str.contains(flag, regex=False).sum())
@@ -1045,6 +1210,8 @@ def render_evidence_trace(results: pd.DataFrame, evidence_cols: list[str]) -> No
         "population_baseline",
         "incoming_flow_records",
         "outgoing_flow_records",
+        "active_hrp_count",
+        "severity_rank",
     ]
     percent_cols = [
         "funding_pct",
@@ -1052,6 +1219,7 @@ def render_evidence_trace(results: pd.DataFrame, evidence_cols: list[str]) -> No
         "worst_sector_funding_pct",
         "top_donor_share",
         "top_recipient_share",
+        "severity_scale",
     ]
 
     for col in money_cols:
@@ -1084,14 +1252,24 @@ def render_method_panel(results: pd.DataFrame, raw_results: pd.DataFrame, year: 
     outgoing_matched = (
         int(results["outgoing_total_usd"].fillna(0).gt(0).sum()) if "outgoing_total_usd" in results else 0
     )
+    active_hrp_matched = int(results["has_active_hrp"].fillna(False).sum()) if "has_active_hrp" in results else 0
+    severity_matched = int(results["severity_scale"].notna().sum()) if "severity_scale" in results else 0
+    cbpf_alias_mapped = (
+        int(results["cbpf_mapping_confidence"].eq("medium_alias_table").sum())
+        if "cbpf_mapping_confidence" in results
+        else 0
+    )
     source_cards = [
         method_card("Active scope", scope, f"{len(results)} rows after dashboard filters; {len(raw_results)} before dashboard filters."),
         method_card("Need source", f"HNO {hno_years}", hno_files or "No HNO source file available in result rows."),
         method_card("Need threshold", fmt_num(min_people), "Rows below the minimum people-in-need threshold are excluded before scoring display."),
         method_card("Funding coverage range", coverage_range, "Computed from FTS funding divided by stated requirements for the selected year."),
+        method_card("Active HRP match", f"{active_hrp_matched}/{len(results)} rows", "Active status is inferred from HRP metadata dates and selected plan year."),
         method_card("Mapped CBPF total", fmt_money(cbpf_total), f"{int((results['cbpf_budget_usd'].fillna(0) > 0).sum())} rows have mapped CBPF allocations."),
+        method_card("CBPF mapping confidence", f"{cbpf_alias_mapped}/{len(results)} alias-mapped", "CBPF country mapping uses pooled fund name aliases and is flagged as prototype-level."),
         method_card("Quality flags", str(int((results["data_quality_flags"] != "ok").sum())), "Rows with non-ok flags remain visible so uncertainty is not hidden."),
         method_card("COD population match", f"{population_matched}/{len(results)} rows", "Admin0 total rows from cod_population_admin0.csv; used only for PIN-share context."),
+        method_card("Severity context match", f"{severity_matched}/{len(results)} rows", "Local context uses HNO PIN divided by COD population; no INFORM/IPC/IDP file is cached."),
         method_card("Sector funding match", f"{sector_matched}/{len(results)} rows", "FTS global-cluster funding rows identify the lowest-funded matched sector."),
         method_card("Flow-detail match", f"{incoming_matched}/{len(results)} incoming; {outgoing_matched}/{len(results)} outgoing", "Only single-country paid/commitment flow records are used for concentration context."),
     ]
@@ -1103,6 +1281,9 @@ def render_method_panel(results: pd.DataFrame, raw_results: pd.DataFrame, year: 
         "Need and financing are separate signals; funding coverage does not redefine need.",
         "Sector-level PIN values are not summed across sectors because populations can overlap.",
         "CBPF is shown as a pooled-fund allocation lens, not as total humanitarian funding.",
+        "HRP active status is derived from HRP metadata dates and selected plan year.",
+        "Need-intensity severity context uses HNO PIN / COD population; it is not an INFORM replacement.",
+        "CBPF country mapping confidence is surfaced because pooled fund name aliasing is prototype-level.",
         "COD population baselines contextualize scale; they do not replace HNO people-in-need values.",
         "Shared multi-country FTS flows are excluded from flow concentration to avoid double counting.",
         "Missing or proxy data is surfaced through flags and confidence labels.",
@@ -1118,6 +1299,8 @@ def render_method_panel(results: pd.DataFrame, raw_results: pd.DataFrame, year: 
     missing_population = int(results["population_baseline"].isna().sum()) if "population_baseline" in results else 0
     missing_sector = int(results["worst_sector"].isna().sum()) if "worst_sector" in results else 0
     missing_flow = int(results["incoming_total_usd"].fillna(0).le(0).sum()) if "incoming_total_usd" in results else 0
+    missing_hrp = int((~results["has_active_hrp"].fillna(False)).sum()) if "has_active_hrp" in results else 0
+    missing_severity = int(results["severity_scale"].isna().sum()) if "severity_scale" in results else 0
     if missing_fts:
         triggered.append(f"{missing_fts} rows have no matched FTS requirements and are lower-confidence funding comparisons.")
     if no_cbpf:
@@ -1132,6 +1315,10 @@ def render_method_panel(results: pd.DataFrame, raw_results: pd.DataFrame, year: 
         triggered.append(f"{missing_sector} rows have no matched FTS global-cluster funding breakdown.")
     if missing_flow:
         triggered.append(f"{missing_flow} rows have no single-country incoming paid/commitment flow detail in the downloaded FTS flow file.")
+    if missing_hrp:
+        triggered.append(f"{missing_hrp} rows have documented need but no matched active HRP in the selected year.")
+    if missing_severity:
+        triggered.append(f"{missing_severity} rows have no local severity context because no COD baseline or external severity file matched.")
     if not triggered:
         triggered.append("No non-ok data quality flags are present in the current filtered result set.")
 
@@ -1160,10 +1347,16 @@ def render_method_panel(results: pd.DataFrame, raw_results: pd.DataFrame, year: 
         "requirements_usd",
         "funding_usd",
         "funding_pct",
+        "has_active_hrp",
+        "active_hrp_names",
+        "hrp_status",
         "cbpf_budget_usd",
         "cbpf_projects",
+        "cbpf_mapping_confidence",
         "population_baseline",
         "pin_population_share",
+        "severity_scale",
+        "severity_context",
         "worst_sector",
         "worst_sector_funding_pct",
         "incoming_total_usd",
@@ -1227,6 +1420,7 @@ query = st.text_input(
     label_visibility="collapsed",
     key="query_input_panel",
 )
+render_query_audit(query, int(year), int(min_people))
 
 try:
     raw_results = build_rankings(

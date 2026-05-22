@@ -126,6 +126,8 @@ def _supplemental_flags(row: pd.Series) -> str:
     incoming_total = pd.to_numeric(row.get("incoming_total_usd"), errors="coerce")
     if pd.isna(incoming_total) or incoming_total <= 0:
         flags.append("no_single_country_incoming_flow_detail")
+    if not bool(row.get("has_active_hrp", False)):
+        flags.append("no_matched_active_hrp")
     return "; ".join(flags) if flags else "ok"
 
 
@@ -160,6 +162,19 @@ def _build_explanation(row: pd.Series) -> str:
         supplemental.append(
             f"COD admin0 data puts PIN at {row.get('pin_population_share'):.1%} of the population baseline."
         )
+    if bool(row.get("has_active_hrp", False)):
+        supplemental.append(
+            f"It has an active HRP in {int(row.get('year'))}; matched FTS funding coverage is {coverage_text}."
+        )
+    else:
+        supplemental.append(
+            f"Need is documented for {int(row.get('year'))}, but no matched active HRP was found in the HRP metadata."
+        )
+    if not pd.isna(row.get("severity_scale")):
+        supplemental.append(
+            f"The available need-intensity context ranks at percentile {row.get('severity_scale'):.0%} "
+            "based on HNO PIN divided by COD admin0 population."
+        )
     if not pd.isna(row.get("worst_sector")):
         supplemental.append(
             f"The lowest matched sector funding coverage is {row.get('worst_sector')} at "
@@ -173,6 +188,66 @@ def _build_explanation(row: pd.Series) -> str:
     if supplemental:
         explanation = f"{explanation} " + " ".join(supplemental)
     return explanation
+
+
+def _summarize_hrp(hrp: pd.DataFrame, year: int) -> pd.DataFrame:
+    columns = [
+        "country_iso3",
+        "has_hrp_record",
+        "has_active_hrp",
+        "active_hrp_count",
+        "active_hrp_names",
+        "active_hrp_codes",
+        "active_hrp_types",
+        "hrp_status",
+    ]
+    if hrp.empty:
+        return pd.DataFrame(columns=columns)
+
+    work = hrp[hrp["year"] == year].copy()
+    if work.empty:
+        return pd.DataFrame(columns=columns)
+    for col in ("plan_name", "plan_code", "plan_type"):
+        if col not in work.columns:
+            work[col] = ""
+    if "hrp_is_active" not in work.columns:
+        work["hrp_is_active"] = True
+
+    any_plan = (
+        work.groupby("country_iso3", as_index=False)
+        .agg(has_hrp_record=("plan_code", "size"))
+        .assign(has_hrp_record=True)
+    )
+    active = work[work["hrp_is_active"].fillna(False).astype(bool)].copy()
+    if active.empty:
+        any_plan["has_active_hrp"] = False
+        any_plan["active_hrp_count"] = 0
+        any_plan["active_hrp_names"] = ""
+        any_plan["active_hrp_codes"] = ""
+        any_plan["active_hrp_types"] = ""
+        any_plan["hrp_status"] = "hrp_record_not_active"
+        return any_plan[columns]
+
+    summary = (
+        active.groupby("country_iso3", as_index=False)
+        .agg(
+            active_hrp_count=("plan_code", "nunique"),
+            active_hrp_names=("plan_name", lambda values: "; ".join(sorted(set(map(str, values)))[:4])),
+            active_hrp_codes=("plan_code", lambda values: "; ".join(sorted(set(map(str, values)))[:4])),
+            active_hrp_types=("plan_type", lambda values: "; ".join(sorted(set(map(str, values)))[:4])),
+        )
+        .copy()
+    )
+    summary["has_active_hrp"] = True
+    summary = any_plan.merge(summary, on="country_iso3", how="left")
+    summary["has_active_hrp"] = summary["has_active_hrp"].fillna(False)
+    summary["active_hrp_count"] = summary["active_hrp_count"].fillna(0)
+    for col in ("active_hrp_names", "active_hrp_codes", "active_hrp_types"):
+        summary[col] = summary[col].fillna("")
+    summary["hrp_status"] = summary["has_active_hrp"].map(
+        {True: "active_hrp", False: "hrp_record_not_active"}
+    )
+    return summary[columns]
 
 
 def _summarize_sector_stress(sector_funding: pd.DataFrame, year: int) -> pd.DataFrame:
@@ -428,6 +503,7 @@ def build_rankings(
 
     funding_year = inputs["funding"][inputs["funding"]["year"] == spec.year].copy()
     cbpf_year = inputs["cbpf"][inputs["cbpf"]["year"] == spec.year].copy()
+    hrp_year = _summarize_hrp(inputs["hrp"], spec.year)
     sector_year = _summarize_sector_stress(inputs["sector_funding"], spec.year)
     incoming_year = _summarize_incoming_flows(inputs["incoming_flows"], spec.year)
     outgoing_year = _summarize_outgoing_flows(inputs["outgoing_flows"], spec.year)
@@ -438,6 +514,10 @@ def build_rankings(
         how="left",
     ).merge(
         cbpf_year.drop(columns=["year"], errors="ignore"),
+        on="country_iso3",
+        how="left",
+    ).merge(
+        hrp_year,
         on="country_iso3",
         how="left",
     ).merge(
@@ -463,6 +543,34 @@ def build_rankings(
     ranked["funding_pct"] = pd.to_numeric(ranked["funding_pct"], errors="coerce")
     ranked["cbpf_budget_usd"] = pd.to_numeric(ranked["cbpf_budget_usd"], errors="coerce").fillna(0)
     ranked["cbpf_projects"] = pd.to_numeric(ranked["cbpf_projects"], errors="coerce").fillna(0)
+    if "cbpf_mapping_confidence" not in ranked.columns:
+        ranked["cbpf_mapping_confidence"] = pd.NA
+    if "cbpf_country_source" not in ranked.columns:
+        ranked["cbpf_country_source"] = pd.NA
+    ranked.loc[
+        ranked["cbpf_budget_usd"] > 0, "cbpf_mapping_confidence"
+    ] = ranked.loc[ranked["cbpf_budget_usd"] > 0, "cbpf_mapping_confidence"].fillna(
+        "medium_alias_table"
+    )
+    ranked.loc[
+        ranked["cbpf_budget_usd"] > 0, "cbpf_country_source"
+    ] = ranked.loc[ranked["cbpf_budget_usd"] > 0, "cbpf_country_source"].fillna(
+        "pooledfundname_alias_table"
+    )
+    ranked.loc[ranked["cbpf_budget_usd"] <= 0, "cbpf_mapping_confidence"] = "not_applicable_no_mapped_allocation"
+    ranked.loc[ranked["cbpf_budget_usd"] <= 0, "cbpf_country_source"] = "no_mapped_cbpf_allocation"
+    for col in ("has_hrp_record", "has_active_hrp"):
+        if col not in ranked.columns:
+            ranked[col] = False
+        ranked[col] = ranked[col].fillna(False).astype(bool)
+    if "active_hrp_count" not in ranked.columns:
+        ranked["active_hrp_count"] = 0
+    ranked["active_hrp_count"] = pd.to_numeric(ranked["active_hrp_count"], errors="coerce").fillna(0)
+    for col in ("active_hrp_names", "active_hrp_codes", "active_hrp_types", "hrp_status"):
+        if col not in ranked.columns:
+            ranked[col] = ""
+        ranked[col] = ranked[col].fillna("")
+    ranked.loc[ranked["hrp_status"].eq(""), "hrp_status"] = "no_hrp_record"
     for col in (
         "population_baseline",
         "population_reference_year",
@@ -487,6 +595,20 @@ def build_rankings(
             ranked[col] = pd.to_numeric(ranked[col], errors="coerce")
     ranked["pin_population_share"] = ranked["people_in_need"] / ranked["population_baseline"].where(
         ranked["population_baseline"] > 0
+    )
+    ranked["severity_source"] = "HNO PIN / COD admin0 population baseline"
+    ranked.loc[ranked["pin_population_share"].isna(), "severity_source"] = "No local INFORM/IPC/IDP severity source matched"
+    ranked["severity_scale"] = _percent_rank(ranked["pin_population_share"])
+    ranked.loc[ranked["pin_population_share"].isna(), "severity_scale"] = pd.NA
+    ranked["severity_rank"] = ranked["severity_scale"].rank(method="min", ascending=False)
+    ranked.loc[ranked["pin_population_share"].isna(), "severity_rank"] = pd.NA
+    ranked["severity_context"] = ranked.apply(
+        lambda row: (
+            f"PIN is {row['pin_population_share']:.1%} of the COD admin0 population baseline."
+            if not pd.isna(row.get("pin_population_share"))
+            else "No local INFORM/IPC/IDP severity file or COD baseline matched this row."
+        ),
+        axis=1,
     )
 
     ranked["funding_gap_for_score"] = 1 - ranked["funding_pct"].clip(lower=0, upper=1)
@@ -540,6 +662,13 @@ def build_rankings(
         ranked = ranked[ranked["country_iso3"].isin(region_countries)]
     if spec.countries:
         ranked = ranked[ranked["country_iso3"].isin(spec.countries)]
+    hrp_filter = getattr(spec, "hrp_filter", None)
+    if hrp_filter == "active":
+        ranked = ranked[ranked["has_active_hrp"]]
+    elif hrp_filter == "missing":
+        ranked = ranked[~ranked["has_active_hrp"]]
+    elif hrp_filter == "any":
+        ranked = ranked[ranked["has_hrp_record"]]
     if spec.min_people_in_need:
         ranked = ranked[ranked["people_in_need"] >= spec.min_people_in_need]
     if spec.funding_pct_max is not None:
@@ -562,13 +691,26 @@ def build_rankings(
         "funding_pct",
         "appeal_names",
         "appeal_types",
+        "has_hrp_record",
+        "has_active_hrp",
+        "active_hrp_count",
+        "active_hrp_names",
+        "active_hrp_codes",
+        "active_hrp_types",
+        "hrp_status",
         "cbpf_budget_usd",
         "cbpf_projects",
         "cbpf_per_person_in_need",
+        "cbpf_mapping_confidence",
+        "cbpf_country_source",
         "population_baseline",
         "population_reference_year",
         "pin_population_share",
         "population_source",
+        "severity_scale",
+        "severity_rank",
+        "severity_context",
+        "severity_source",
         "sector_count",
         "sector_requirements_usd",
         "sector_funding_usd",
